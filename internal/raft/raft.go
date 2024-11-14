@@ -60,7 +60,7 @@ type TipoOperacion struct {
 	Valor     string // en el caso de la lectura Valor = ""
 }
 
-type EntradaLogs struct {
+type Entrada struct {
 	Operacion TipoOperacion
 	Indice    int
 	Mandato   int
@@ -89,15 +89,15 @@ type NodoRaft struct {
 	// Estado persistente en todos los nodos
 	MandatoActual int
 	NodoVotado    int
-	logEntries    []EntradaLogs
+	Log           []Entrada
 
 	// Estado volátil en todos los nodos
-	lastApplied int
-	commitIndex int
+	LastApplied int // Indice del último log
+	CommitIndex int // Indice del último log comiteado
 
 	// Estado volátil en los líderes
-	nextIndex  []int
-	MatchIndex []int
+	NextIndex  []int // Indice de la siguiente entrada a enviar
+	MatchIndex []int // Indice del último log que ha sido replicado
 
 	// Variables adicionales
 	RolNodo            string
@@ -105,7 +105,7 @@ type NodoRaft struct {
 	LatidoLider        chan bool
 	HayMandatoSuperior chan bool
 	HayMayoria         chan bool
-	AnyadirEntrada      chan EntradaLogs
+	NuevaEntrada       chan Entrada
 }
 
 // Creacion de un nuevo nodo de eleccion
@@ -233,19 +233,13 @@ func (nr *NodoRaft) someterOperacion(operacion TipoOperacion) (int, int,
 	// VUESTRO CODIGO AQUI
 	nr.Yo, mandato, EsLider, idLider = nr.obtenerEstado()
 
-	nuevaEntrada := EntradaLogs{
-		Operacion: operacion,
-		Indice:    indice,
-		Mandato:   mandato,
-	}
-
 	if EsLider {
-		nuevaEntrada := EntradaLogs{
+		entrada := Entrada{
 			Operacion: operacion,
 			Indice:    indice,
 			Mandato:   mandato,
 		}
-		nr.logEntries = append(nr.logEntries, nuevaEntrada)
+		nr.Log = append(nr.Log, entrada)
 	} else {
 
 	}
@@ -338,14 +332,15 @@ func (nr *NodoRaft) PedirVoto(peticion *ArgsPeticionVoto,
 }
 
 type ArgAppendEntries struct {
-	// Vuestros datos aqui
-	Mandato int
-	IdLider int
-	Entrada EntradaLogs
+	Mandato      int
+	IdLider      int
+	PrevLogIndex int       // Indice de la entrada enterior a las nuevas
+	PrevLogTerm  int       // Mandato de la entrada anterior a las nuevas
+	Entries      []Entrada // Entradas que se quieren agregar
+	LeaderCommit int       // Indice de la última entrada comprometida del lider
 }
 
 type Results struct {
-	// Vuestros datos aqui
 	Mandato             int
 	EntradaComprometida bool
 }
@@ -353,8 +348,7 @@ type Results struct {
 // Metodo de tratamiento de llamadas RPC AppendEntries
 func (nr *NodoRaft) AppendEntries(args *ArgAppendEntries,
 	results *Results) error {
-	// Completar....
-	if args.Entrada == (EntradaLogs{}) {
+	if len(args.Entries) == 0 {
 		if args.Mandato < nr.MandatoActual {
 			results.Mandato = nr.MandatoActual
 		} else if args.Mandato == nr.MandatoActual {
@@ -374,8 +368,37 @@ func (nr *NodoRaft) AppendEntries(args *ArgAppendEntries,
 				nr.LatidoLider <- true
 			}
 		}
-	}
+	} else {
+		// Procesamiento de entradas
+		if args.Mandato < nr.MandatoActual {
+			results.Mandato = nr.MandatoActual
+			results.EntradaComprometida = false
+		}
+		// Verificamos si el log contiene la entrada correcta en prevLogIndex
+		if args.PrevLogIndex >= 0 && (args.PrevLogIndex >= len(nr.Log) ||
+			nr.Log[args.PrevLogIndex].Mandato != args.PrevLogTerm) {
+			results.EntradaComprometida = false
+			return nil
+		}
 
+		for i := range args.Entries {
+			logIndex := args.PrevLogIndex + 1 + i
+			if logIndex < len(nr.Log) && nr.Log[logIndex].Mandato != args.Entries[i].Mandato {
+				nr.Log = nr.Log[:logIndex]
+				break
+			}
+		}
+
+		nr.Log = append(nr.Log[:args.PrevLogIndex+1], args.Entries...)
+
+		// Actualizar commitIndex si es necesario
+		if args.LeaderCommit > nr.CommitIndex {
+			nr.CommitIndex = min(args.LeaderCommit, len(nr.Log)-1)
+		}
+
+		results.Mandato = nr.MandatoActual
+		results.EntradaComprometida = true
+	}
 	return nil
 }
 
@@ -489,7 +512,6 @@ func gestionSeguidor(nr *NodoRaft) {
 	case <-nr.HayMandatoSuperior: //dimite y vuelve a ser seguidor
 		nr.RolNodo = "seguidor"
 	}
-	case <- nr.Añadir
 }
 
 func gestionCandidato(nr *NodoRaft) {
@@ -531,6 +553,8 @@ func gestionLider(nr *NodoRaft) {
 		nr.RolNodo = "seguidor"
 	case <-latidoTimer.C:
 		fmt.Print("Latido enviado a los seguidores")
+	case nuevaEntrada := <-nr.NuevaEntrada:
+		nr.Log = append(nr.Log, nuevaEntrada)
 	}
 }
 
@@ -539,8 +563,15 @@ func enviarLatidosAux(nr *NodoRaft) {
 	for i := 0; i < len(nr.Nodos); i++ {
 		if i != nr.Yo {
 			go nr.enviarLatidosAppendEntry(i,
-				&ArgAppendEntries{nr.MandatoActual, nr.IdLider,
-					EntradaLogs{}}, &results)
+				&ArgAppendEntries{nr.MandatoActual, nr.IdLider, -1, -1,
+					[]Entrada{}, -1}, &results)
 		}
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
