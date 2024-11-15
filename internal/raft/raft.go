@@ -230,20 +230,18 @@ func (nr *NodoRaft) someterOperacion(operacion TipoOperacion) (int, int,
 
 	fmt.Println(operacion)
 
-	// VUESTRO CODIGO AQUI
-	nr.Yo, mandato, EsLider, idLider = nr.obtenerEstado()
-
-	if EsLider {
+	if !EsLider {
+		fmt.Println("No puedo realizar la operación no soy el líder")
+	} else {
 		entrada := Entrada{
 			Operacion: operacion,
-			Indice:    indice,
-			Mandato:   mandato,
+			Indice:    len(nr.Log) + 1,
+			Mandato:   nr.MandatoActual,
 		}
 		nr.Log = append(nr.Log, entrada)
-	} else {
-
+		nr.NuevaEntrada <- entrada
 	}
-
+	// Aquí tendría que esperar a que el resto de nodos le confirmasen la operación ****************************************************
 	return indice, mandato, EsLider, idLider, valorADevolver
 }
 
@@ -336,7 +334,7 @@ type ArgAppendEntries struct {
 	IdLider      int
 	PrevLogIndex int       // Indice de la entrada enterior a las nuevas
 	PrevLogTerm  int       // Mandato de la entrada anterior a las nuevas
-	Entries      []Entrada // Entradas que se quieren agregar
+	NewEntries   []Entrada // Entradas que se quieren agregar
 	LeaderCommit int       // Indice de la última entrada comprometida del lider
 }
 
@@ -348,7 +346,7 @@ type Results struct {
 // Metodo de tratamiento de llamadas RPC AppendEntries
 func (nr *NodoRaft) AppendEntries(args *ArgAppendEntries,
 	results *Results) error {
-	if len(args.Entries) == 0 {
+	if len(args.NewEntries) == 0 {
 		if args.Mandato < nr.MandatoActual {
 			results.Mandato = nr.MandatoActual
 		} else if args.Mandato == nr.MandatoActual {
@@ -369,27 +367,37 @@ func (nr *NodoRaft) AppendEntries(args *ArgAppendEntries,
 			}
 		}
 	} else {
+
 		// Procesamiento de entradas
+		// Cuando un puto Líder manda entradas a un puto Seguidor
+		// Por tanto esto se supone que es un puto Seguidor
+		// Por tanto en efecto si el mandato del líder es menor al del seguidor le dice pero tu que cojones haces pimpim anda pa alla
 		if args.Mandato < nr.MandatoActual {
 			results.Mandato = nr.MandatoActual
 			results.EntradaComprometida = false
 		}
-		// Verificamos si el log contiene la entrada correcta en prevLogIndex
+
+		// Verificamos si el log contiene la entrada correcta en prevLogIndex, ya que si vamos a agragar entradas nuevas, estaría bien que al menos la entrada anterior a la que vamos a añadir coincidan la del seguidor y la del líder
+		// La cosa es que si entra aquí significa que el seguidor tiene que actualizar su log
+		// Esta funcionalidad se aplicará en la Práctica 4
 		if args.PrevLogIndex >= 0 && (args.PrevLogIndex >= len(nr.Log) ||
 			nr.Log[args.PrevLogIndex].Mandato != args.PrevLogTerm) {
+			//Agregar funcionalidad en p4
 			results.EntradaComprometida = false
 			return nil
 		}
 
-		for i := range args.Entries {
+		//
+		for i := range args.NewEntries {
 			logIndex := args.PrevLogIndex + 1 + i
-			if logIndex < len(nr.Log) && nr.Log[logIndex].Mandato != args.Entries[i].Mandato {
+			if logIndex < len(nr.Log) &&
+				nr.Log[logIndex].Mandato != args.NewEntries[i].Mandato {
 				nr.Log = nr.Log[:logIndex]
 				break
 			}
 		}
 
-		nr.Log = append(nr.Log[:args.PrevLogIndex+1], args.Entries...)
+		nr.Log = append(nr.Log[:args.PrevLogIndex+1], args.NewEntries...)
 
 		// Actualizar commitIndex si es necesario
 		if args.LeaderCommit > nr.CommitIndex {
@@ -554,7 +562,7 @@ func gestionLider(nr *NodoRaft) {
 	case <-latidoTimer.C:
 		fmt.Print("Latido enviado a los seguidores")
 	case nuevaEntrada := <-nr.NuevaEntrada:
-		nr.Log = append(nr.Log, nuevaEntrada)
+		enviarLatidosAppendOperacion(nr, nuevaEntrada)
 	}
 }
 
@@ -565,6 +573,21 @@ func enviarLatidosAux(nr *NodoRaft) {
 			go nr.enviarLatidosAppendEntry(i,
 				&ArgAppendEntries{nr.MandatoActual, nr.IdLider, -1, -1,
 					[]Entrada{}, -1}, &results)
+		}
+	}
+}
+
+func enviarLatidosAppendOperacion(nr *NodoRaft, newEn Entrada) {
+	var results Results
+	var prevIndex int
+	var prevLogTerm int
+	prevIndex = len(nr.Log) - 1
+	prevLogTerm = nr.Log[prevIndex].Mandato
+	for i := 0; i < len(nr.Nodos); i++ {
+		if i != nr.Yo {
+			go nr.enviarLatidosAppendEntry(i,
+				&ArgAppendEntries{nr.MandatoActual, nr.Yo, prevIndex, prevLogTerm,
+					[]Entrada{newEn}, -1}, &results)
 		}
 	}
 }
